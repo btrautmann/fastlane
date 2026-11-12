@@ -2,6 +2,11 @@ require 'scan'
 
 describe Scan do
   describe Scan::Runner do
+    before(:each) do
+      fake_out_simulator_detection
+      fake_out_build_settings(SCAN_BUILD_SETTINGS)
+    end
+
     describe "handle_results" do
       before(:each) do
         mock_slack_poster = Object.new
@@ -177,6 +182,14 @@ describe Scan do
 
     describe "retry_execute" do
       before(:each) do
+        # Every other group in this file builds its own config. This one relied
+        # on whichever of them ran first leaving one behind, and Scan.config is
+        # module level, so it outlives the example that made it. See
+        # fastlane#30184.
+        Scan.config = FastlaneCore::Configuration.create(Scan::Options.available_options, {
+          project: './scan/examples/standard/app.xcodeproj'
+        })
+
         @scan = Scan::Runner.new
       end
 
@@ -243,6 +256,14 @@ FastlaneAppTests.testCoinToss()
         @scan = Scan::Runner.new
       end
 
+      it "is deprecated" do
+        Tempfile.create("junit_report") do |report|
+          Scan.cache[:temp_junit_report] = report.path
+          expect(FastlaneCore::UI).to receive(:deprecated).with(/Scan::Runner#test_results is deprecated/)
+          @scan.test_results
+        end
+      end
+
       it "still proceeds successfully if the temp junit report was deleted", requires_xcodebuild: true do
         Scan.cache[:temp_junit_report] = '/var/folders/non_existent_file.junit'
         expect(@scan.test_results).to_not(be_nil)
@@ -262,6 +283,18 @@ FastlaneAppTests.testCoinToss()
           expect(@scan.test_results).to_not(be_nil)
           expect(Scan.cache[:temp_junit_report]).to_not(eq('/var/folders/non_existent_file.junit'))
         end
+      end
+    end
+
+    describe "#open_report" do
+      it "opens the report with its path as one argument" do
+        report_path = "/Users/me/Kaldi's Kafe/fastlane/test_output/report.html"
+        allow(FastlaneCore::Helper).to receive(:ci?).and_return(false)
+        allow(Scan).to receive(:cache).and_return({ open_html_report_path: report_path })
+        scan = Scan::Runner.new
+
+        expect(scan).to receive(:system).with("open", "--hide", report_path)
+        scan.open_report
       end
     end
 
@@ -293,7 +326,7 @@ FastlaneAppTests.testCoinToss()
         output_path = File.absolute_path('/tmp/scan_results/build_products.zip')
 
         expect(FastlaneCore::Helper).to receive(:backticks)
-          .with("cd '#{path}' && rm -f '#{output_path}' && zip -r '#{output_path}' *", { print: false })
+          .with("cd #{path.shellescape} && rm -f #{output_path.shellescape} && zip -r #{output_path.shellescape} *", { print: false })
           .exactly(1).times
 
         scan = Scan::Runner.new

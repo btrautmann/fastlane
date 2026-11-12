@@ -321,6 +321,23 @@ else
     error "Error: Only can resign .app files and .ipa files."
 fi
 
+# Stop if a symbolic link resolves outside the temporary directory: later steps write through such links.
+# Resolved with the cd -P and pwd -P builtins, as realpath and readlink -f are missing on older macOS.
+TEMP_DIR_PHYSICAL="$(cd -P "$TEMP_DIR" && pwd -P)"
+checkStatus
+while IFS= read -d '' -r link; do
+    target="$(readlink "$link")"
+    [[ "$target" == /* ]] || target="$(dirname "$link")/$target"
+    if [ -d "$target" ]; then
+        resolved="$(cd -P "$target" 2>/dev/null && pwd -P)"
+    else
+        resolved="$(cd -P "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target")"
+    fi
+    if [[ "$resolved" != "$TEMP_DIR_PHYSICAL" && "$resolved" != "$TEMP_DIR_PHYSICAL"/* ]]; then
+        error "Error: '${link#"$TEMP_DIR"/}' is a symbolic link to '$(readlink "$link")', outside of '$ORIGINAL_FILE'. Remove it before resigning."
+    fi
+done < <(find "$TEMP_DIR" -type l -print0)
+
 # check the keychain
 if [ "${KEYCHAIN}" != "" ]; then
     security list-keychains -s "$KEYCHAIN"
@@ -366,10 +383,17 @@ function provision_for_bundle_id {
     done
 }
 
+# Print the plist inside a provisioning profile. Unlike `security cms -D`, this imports no certificate
+# into the default keychain (#30186). Like it, it does not check the signature.
+function decode_provision {
+
+    /usr/bin/openssl smime -verify -noverify -nosigs -inform DER -in "$1" 2> >(grep -v '^Verification successful$' >&2)
+}
+
 # Find the bundle identifier contained inside a provisioning profile
 function bundle_id_for_provision {
 
-    local FULL_BUNDLE_ID=$(PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<< "$(security cms -D -i "$1")")
+    local FULL_BUNDLE_ID=$(PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<< "$(decode_provision "$1")")
     checkStatus
     echo "${FULL_BUNDLE_ID#*.}"
 }
@@ -485,7 +509,7 @@ function resign {
 
     # Replace the embedded mobile provisioning profile
     log "Validating the new provisioning profile: $NEW_PROVISION"
-    security cms -D -i "$NEW_PROVISION" > "$TEMP_DIR/profile.plist"
+    decode_provision "$NEW_PROVISION" > "$TEMP_DIR/profile.plist"
     checkStatus
 
     APP_IDENTIFIER_PREFIX=$(PlistBuddy -c "Print :Entitlements:application-identifier" "$TEMP_DIR/profile.plist" | grep -E '^[A-Z0-9]*' -o | tr -d '\n')
@@ -664,10 +688,19 @@ function resign {
 
         # Get the old and the new team ID
         # Old team ID is not part of app entitlements, have to get it from old embedded provisioning profile
-        security cms -D -i "$TEMP_DIR/old-embedded.mobileprovision" > "$TEMP_DIR/old-embedded-profile.plist"
-        OLD_TEAM_ID=$(PlistBuddy -c "Print :TeamIdentifier:0" "$TEMP_DIR/old-embedded-profile.plist")
+        decode_provision "$TEMP_DIR/old-embedded.mobileprovision" > "$TEMP_DIR/old-embedded-profile.plist"
+        OLD_TEAM_ID=$(PlistBuddy -c "Print :TeamIdentifier:0" "$TEMP_DIR/old-embedded-profile.plist" 2>/dev/null)
+        if [ "$OLD_TEAM_ID" == "" ]; then
+            OLD_TEAM_ID="$OLD_APP_ID"
+        fi
         # New team ID is part of profile entitlements
-        NEW_TEAM_ID=$(PlistBuddy -c "Print com.apple.developer.team-identifier" "$PROFILE_ENTITLEMENTS" | grep -E '^[A-Z0-9]*' -o | tr -d '\n')
+        NEW_TEAM_ID=$(PlistBuddy -c "Print :com.apple.developer.team-identifier" "$PROFILE_ENTITLEMENTS" 2>/dev/null | grep -E '^[A-Z0-9]*' -o | tr -d '\n')
+        if [ "$NEW_TEAM_ID" == "" ]; then
+            NEW_TEAM_ID="$TEAM_IDENTIFIER"
+        fi
+        if [ "$NEW_TEAM_ID" == "" ]; then
+            NEW_TEAM_ID="$NEW_APP_ID"
+        fi
 
         log "Patching profile entitlements with values from app entitlements"
         PATCHED_ENTITLEMENTS="$TEMP_DIR/patchedEntitlements"
@@ -866,13 +899,16 @@ function resign {
         OLD_BUNDLE_ID="$(PlistBuddy -c "Print :CFBundleIdentifier" "$TEMP_DIR/oldInfo.plist")"
         NEW_BUNDLE_ID="$(bundle_id_for_provision "$NEW_PROVISION")"
         log "Replacing old bundle ID '$OLD_BUNDLE_ID' with new bundle ID '$NEW_BUNDLE_ID' in patched entitlements"
-        # Note: ideally we'd match against the opening <string> tag too, but this isn't possible
-        # because $OLD_BUNDLE_ID and $NEW_BUNDLE_ID do not include the team ID prefix which is
-        # present in the entitlements file.
-        # e.g. <string>AB1GP98Q19.com.example.foo</string>
-        #         vs
-        #      com.example.foo
-        /usr/bin/sed -i .bak "s!${OLD_BUNDLE_ID}</string>!${NEW_BUNDLE_ID}</string>!g" "$PATCHED_ENTITLEMENTS"
+        # Anchor the replacement to OLD_TEAM_ID prefix, app group prefix, or the opening <string> tag
+        # so that if NEW_BUNDLE_ID contains OLD_BUNDLE_ID as a suffix (e.g. enterprise.com.example.foo),
+        # the already-correct values (like <TEAM_ID>.enterprise.com.example.foo) do not have their
+        # suffix duplicated.
+        ESCAPED_OLD_BUNDLE_ID="${OLD_BUNDLE_ID//./\\.}"
+        if [ -n "$OLD_TEAM_ID" ] && [ -n "$NEW_TEAM_ID" ]; then
+            /usr/bin/sed -i .bak "s!<string>${OLD_TEAM_ID}\.${ESCAPED_OLD_BUNDLE_ID}</string>!<string>${NEW_TEAM_ID}.${NEW_BUNDLE_ID}</string>!g" "$PATCHED_ENTITLEMENTS"
+        fi
+        /usr/bin/sed -i .bak "s!<string>group\.${ESCAPED_OLD_BUNDLE_ID}</string>!<string>group.${NEW_BUNDLE_ID}</string>!g" "$PATCHED_ENTITLEMENTS"
+        /usr/bin/sed -i .bak "s!<string>${ESCAPED_OLD_BUNDLE_ID}</string>!<string>${NEW_BUNDLE_ID}</string>!g" "$PATCHED_ENTITLEMENTS"
 
         log "Resigning application using certificate: '$CERTIFICATE'"
         log "and patched entitlements:"

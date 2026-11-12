@@ -1,5 +1,7 @@
 require "open3"
 require "tempfile"
+require "openssl"
+require "shellwords"
 
 describe "resign.sh" do
   RESIGN_SH_PATH = File.expand_path("../lib/assets/resign.sh", File.dirname(__FILE__))
@@ -36,6 +38,65 @@ describe "resign.sh" do
   # Run a bash script and return [stdout, stderr, status]
   def run_bash(script)
     Open3.capture3("bash", "-c", script)
+  end
+
+  # A provisioning profile: the plist, signed as CMS by a throwaway self-signed certificate.
+  def signed_profile(plist)
+    key = OpenSSL::PKey::RSA.new(2048)
+    cert = OpenSSL::X509::Certificate.new
+    cert.version = 2
+    cert.serial = 1
+    cert.subject = cert.issuer = OpenSSL::X509::Name.parse("/CN=Test Profile Signing")
+    cert.public_key = key.public_key
+    cert.not_before = Time.now - 60
+    cert.not_after = Time.now + 3600
+    cert.sign(key, OpenSSL::Digest.new("SHA256"))
+    OpenSSL::PKCS7.sign(cert, key, plist, [], OpenSSL::PKCS7::BINARY).to_der
+  end
+
+  describe "decode_provision" do
+    before(:each) do
+      skip("/usr/bin/openssl required") unless File.executable?("/usr/bin/openssl")
+      @func = extract_function(@resign_sh_content, "decode_provision")
+    end
+
+    def decode(path)
+      run_bash("#{@func}\ndecode_provision #{path.shellescape}")
+    end
+
+    it "prints the plist inside the profile, and nothing on stderr" do
+      Dir.mktmpdir do |dir|
+        plist = '<plist version="1.0"><dict><key>Name</key><string>Test</string></dict></plist>'
+        path = File.join(dir, "test.mobileprovision")
+        File.binwrite(path, signed_profile(plist))
+
+        stdout, stderr, status = decode(path)
+
+        expect(status.success?).to be(true)
+        expect(stdout).to eq(plist)
+        expect(stderr).to eq("")
+      end
+    end
+
+    it "decodes a profile whose signature does not match its content, as `security cms -D` does" do
+      stdout, _, status = decode(File.expand_path("../../match/spec/fixtures/test.provisionprofile", __dir__))
+
+      expect(status.success?).to be(true)
+      expect(stdout).to include("<key>UUID</key>")
+    end
+
+    it "fails on a file that is not a profile" do
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "not.mobileprovision")
+        File.write(path, "not a profile")
+
+        stdout, stderr, status = decode(path)
+
+        expect(status.success?).to be(false)
+        expect(stdout).to eq("")
+        expect(stderr).not_to eq("")
+      end
+    end
   end
 
   # ─── Group A: does_bundle_id_match ────────────────────────────────────
@@ -164,14 +225,21 @@ describe "resign.sh" do
       skip("BSD sed required (macOS only)") unless RUBY_PLATFORM.include?("darwin")
     end
 
-    def run_sed_replacement(input_xml, old_id, new_id)
+    def run_sed_replacement(input_xml, old_id, new_id, old_team_id = "TEAM", new_team_id = "TEAM")
       Dir.mktmpdir do |dir|
         file_path = File.join(dir, "entitlements.plist")
         File.write(file_path, input_xml)
         script = <<~BASH
           OLD_BUNDLE_ID="#{old_id}"
           NEW_BUNDLE_ID="#{new_id}"
-          /usr/bin/sed -i .bak "s!${OLD_BUNDLE_ID}</string>!${NEW_BUNDLE_ID}</string>!g" "#{file_path}"
+          OLD_TEAM_ID="#{old_team_id}"
+          NEW_TEAM_ID="#{new_team_id}"
+          ESCAPED_OLD_BUNDLE_ID="${OLD_BUNDLE_ID//./\\\\.}"
+          if [ -n "$OLD_TEAM_ID" ] && [ -n "$NEW_TEAM_ID" ]; then
+              /usr/bin/sed -i .bak "s!<string>${OLD_TEAM_ID}\\.${ESCAPED_OLD_BUNDLE_ID}</string>!<string>${NEW_TEAM_ID}.${NEW_BUNDLE_ID}</string>!g" "#{file_path}"
+          fi
+          /usr/bin/sed -i .bak "s!<string>group\\.${ESCAPED_OLD_BUNDLE_ID}</string>!<string>group.${NEW_BUNDLE_ID}</string>!g" "#{file_path}"
+          /usr/bin/sed -i .bak "s!<string>${ESCAPED_OLD_BUNDLE_ID}</string>!<string>${NEW_BUNDLE_ID}</string>!g" "#{file_path}"
           cat "#{file_path}"
         BASH
         stdout, _, status = run_bash(script)
@@ -182,7 +250,7 @@ describe "resign.sh" do
 
     it "replaces bundle ID before </string> tag" do
       input = "<string>AB1GP98Q19.com.old.app</string>"
-      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      result = run_sed_replacement(input, "com.old.app", "com.new.app", "AB1GP98Q19", "AB1GP98Q19")
       expect(result.strip).to eq("<string>AB1GP98Q19.com.new.app</string>")
     end
 
@@ -190,10 +258,12 @@ describe "resign.sh" do
       input = <<~XML
         <string>TEAM.com.old.app</string>
         <string>group.com.old.app</string>
+        <string>com.old.app</string>
       XML
-      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      result = run_sed_replacement(input, "com.old.app", "com.new.app", "TEAM", "TEAM")
       expect(result).to include("<string>TEAM.com.new.app</string>")
       expect(result).to include("<string>group.com.new.app</string>")
+      expect(result).to include("<string>com.new.app</string>")
     end
 
     it "only replaces before </string> tag, not </key>" do
@@ -201,14 +271,14 @@ describe "resign.sh" do
         <key>com.old.app</key>
         <string>TEAM.com.old.app</string>
       XML
-      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      result = run_sed_replacement(input, "com.old.app", "com.new.app", "TEAM", "TEAM")
       expect(result).to include("<key>com.old.app</key>")
       expect(result).to include("<string>TEAM.com.new.app</string>")
     end
 
     it "preserves team ID prefix" do
       input = "<string>TEAMIDPREF.com.old.app</string>"
-      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      result = run_sed_replacement(input, "com.old.app", "com.new.app", "TEAMIDPREF", "TEAMIDPREF")
       expect(result.strip).to eq("<string>TEAMIDPREF.com.new.app</string>")
     end
 
@@ -218,20 +288,64 @@ describe "resign.sh" do
       expect(result.strip).to eq("<string>group.com.new.app</string>")
     end
 
+    it "replaces un-prefixed bundle ID entries" do
+      input = "<string>com.old.app</string>"
+      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      expect(result.strip).to eq("<string>com.new.app</string>")
+    end
+
     it "does not match partial IDs with extra suffix" do
       input = <<~XML
         <string>TEAM.com.old.app.extra</string>
         <string>TEAM.com.old.app</string>
       XML
-      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      result = run_sed_replacement(input, "com.old.app", "com.new.app", "TEAM", "TEAM")
       expect(result).to include("<string>TEAM.com.old.app.extra</string>")
       expect(result).to include("<string>TEAM.com.new.app</string>")
     end
 
+    it "does not match unescaped dots in bundle ID regex" do
+      input = "<string>comXoldXapp</string>"
+      result = run_sed_replacement(input, "com.old.app", "com.new.app")
+      expect(result.strip).to eq("<string>comXoldXapp</string>")
+    end
+
     it "handles multi-component bundle IDs" do
       input = "<string>TEAM.com.example.my.app</string>"
-      result = run_sed_replacement(input, "com.example.my.app", "com.newco.other.app")
+      result = run_sed_replacement(input, "com.example.my.app", "com.newco.other.app", "TEAM", "TEAM")
       expect(result.strip).to eq("<string>TEAM.com.newco.other.app</string>")
+    end
+
+    it "does not duplicate prefix when new bundle ID has old bundle ID as suffix (issue #30167)" do
+      input = <<~XML
+        <string>NEWTEAM.enterprise.com.old.app</string>
+        <string>OLDTEAM.com.old.app</string>
+        <string>group.enterprise.com.old.app</string>
+        <string>group.com.old.app</string>
+        <string>com.old.app</string>
+      XML
+      result = run_sed_replacement(input, "com.old.app", "enterprise.com.old.app", "OLDTEAM", "NEWTEAM")
+      expect(result).to include("<string>NEWTEAM.enterprise.com.old.app</string>")
+      expect(result).not_to include("<string>NEWTEAM.enterprise.enterprise.com.old.app</string>")
+      expect(result).to include("<string>group.enterprise.com.old.app</string>")
+      expect(result).not_to include("<string>group.enterprise.enterprise.com.old.app</string>")
+      expect(result).to include("<string>enterprise.com.old.app</string>")
+    end
+
+    it "handles same-team resign with prefixed bundle ID (issue #30167)" do
+      input = <<~XML
+        <string>TEAMID.enterprise.com.old.app</string>
+        <string>TEAMID.com.old.app</string>
+        <string>group.enterprise.com.old.app</string>
+        <string>group.com.old.app</string>
+        <string>com.old.app</string>
+      XML
+      result = run_sed_replacement(input, "com.old.app", "enterprise.com.old.app", "TEAMID", "TEAMID")
+      expect(result).to include("<string>TEAMID.enterprise.com.old.app</string>")
+      expect(result).not_to include("<string>TEAMID.enterprise.enterprise.com.old.app</string>")
+      expect(result).to include("<string>group.enterprise.com.old.app</string>")
+      expect(result).not_to include("<string>group.enterprise.enterprise.com.old.app</string>")
+      expect(result).to include("<string>enterprise.com.old.app</string>")
     end
   end
 
@@ -338,6 +452,101 @@ describe "resign.sh" do
         stdout, _, status = run_bash(script)
         expect(status.success?).to be(true)
         expect(stdout.strip).to eq('com\.apple\.developer\.icloud-container-identifiers')
+      end
+    end
+  end
+
+  # ─── Group E: symbolic links in the ipa ───────────────────────────────
+  describe "symbolic links in the ipa" do
+    before(:each) do
+      skip("PlistBuddy and codesign required (macOS only)") unless RUBY_PLATFORM.include?("darwin")
+    end
+
+    # Stubs `security`, which logs its arguments and fails, and `xcodebuild`, and signs ad hoc ("-"), so no keychain is used.
+    def resign_ipa(dir, input: "ipa", args: [])
+      bin = File.join(dir, "bin")
+      FileUtils.mkdir_p(bin)
+      File.write(File.join(bin, "xcodebuild"), "#!/bin/bash\necho 'Xcode 16.0'\n")
+      File.write(File.join(bin, "security"), "#!/bin/bash\necho \"$*\" >> '#{File.join(dir, 'security.log')}'\nexit 1\n")
+      FileUtils.chmod(0o755, Dir[File.join(bin, "*")])
+      File.binwrite(File.join(dir, "new.mobileprovision"), signed_profile('<plist version="1.0"><dict><key>Entitlements</key><dict><key>application-identifier</key><string>ABCDE12345.com.example.test</string><key>com.apple.developer.team-identifier</key><string>ABCDE12345</string></dict></dict></plist>'))
+
+      app = File.join(dir, "content", "Payload", "Test.app")
+      FileUtils.mkdir_p(app)
+      File.write(File.join(app, "Info.plist"), '<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.test</string><key>CFBundleExecutable</key><string>Test</string></dict></plist>')
+      FileUtils.cp("/usr/bin/true", File.join(app, "Test"))
+      yield(app)
+      original = app
+      if input == "ipa"
+        expect(system("zip", "-qry", "../test.ipa", "Payload", chdir: File.join(dir, "content"))).to be(true)
+        original = File.join(dir, "test.ipa")
+      end
+
+      work = File.join(dir, "work")
+      FileUtils.mkdir_p(work)
+      env = { "PATH" => "#{bin}:#{ENV.fetch('PATH')}" }
+      Open3.capture3(env, "bash", RESIGN_SH_PATH, original, "-", "-p", File.join(dir, "new.mobileprovision"), *args, File.join(dir, "resigned.ipa"), chdir: work)
+    end
+
+    it "stops when a link points outside the ipa and leaves its target unchanged" do
+      Dir.mktmpdir do |outside|
+        sentinel = File.join(outside, "sentinel.mobileprovision")
+        File.write(sentinel, "unchanged")
+        Dir.mktmpdir do |dir|
+          _, stderr, status = resign_ipa(dir) do |app|
+            File.symlink(sentinel, File.join(app, "embedded.mobileprovision"))
+          end
+
+          expect(status.success?).to be(false)
+          # Since macOS 26.7.2, unzip refuses to create the link, before resign.sh's own check runs
+          expect(stderr).to include("'Payload/Test.app/embedded.mobileprovision' is a symbolic link to '#{sentinel}'").or(include("symlink error: Permission denied"))
+          expect(File.read(sentinel)).to eq("unchanged")
+        end
+      end
+    end
+
+    it "stops when a link in an app points outside it and leaves its target unchanged" do
+      Dir.mktmpdir do |outside|
+        sentinel = File.join(outside, "sentinel.mobileprovision")
+        File.write(sentinel, "unchanged")
+        Dir.mktmpdir do |dir|
+          _, stderr, status = resign_ipa(dir, input: "app") do |app|
+            File.symlink(sentinel, File.join(app, "embedded.mobileprovision"))
+          end
+
+          expect(status.success?).to be(false)
+          expect(stderr).to include("'Payload/Test.app/embedded.mobileprovision' is a symbolic link to '#{sentinel}'")
+          expect(File.read(sentinel)).to eq("unchanged")
+        end
+      end
+    end
+
+    it "keeps links that stay inside the app" do
+      Dir.mktmpdir do |dir|
+        _, stderr, status = resign_ipa(dir) do |app|
+          FileUtils.mkdir_p(File.join(app, "Assets", "A"))
+          File.write(File.join(app, "Assets", "A", "file"), "content")
+          File.symlink("A", File.join(app, "Assets", "Current"))
+        end
+
+        expect(status.success?).to be(true), stderr
+        listing, = Open3.capture2("zipinfo", File.join(dir, "resigned.ipa"), "Payload/Test.app/Assets/Current")
+        expect(listing).to start_with("l")
+      end
+    end
+
+    it "decodes the profiles without `security cms`, which imports certificates into the default keychain" do
+      Dir.mktmpdir do |dir|
+        # --use-app-entitlements also decodes the app's old embedded profile.
+        stdout, stderr, status = resign_ipa(dir, args: ["--use-app-entitlements"]) do |app|
+          File.binwrite(File.join(app, "embedded.mobileprovision"), signed_profile('<plist version="1.0"><dict><key>TeamIdentifier</key><array><string>OLDTEAM123</string></array></dict></plist>'))
+        end
+
+        expect(status.success?).to be(true), stderr
+        # Printed further down the --use-app-entitlements branch, so the old embedded profile was decoded.
+        expect(stdout + stderr).to include("WARNING: Changing team while resigning")
+        security_calls = File.exist?(File.join(dir, "security.log")) ? File.read(File.join(dir, "security.log")) : ""
+        expect(security_calls).not_to include("cms")
       end
     end
   end

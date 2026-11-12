@@ -1,3 +1,10 @@
+# FastlanePty requires this lazily, inside spawn_with_pty, so examples below that
+# reference the PTY constant only find it when something has already run a pty
+# backed command in this process. Require it here so they do not depend on that.
+# Guarded because pty is not available on Windows, where those examples are
+# skipped anyway. See fastlane#30184.
+require 'pty' unless FastlaneCore::Helper.windows?
+
 describe FastlaneCore do
   describe FastlaneCore::CommandExecutor do
     describe "execute" do
@@ -5,9 +12,15 @@ describe FastlaneCore do
       let(:failing_command_output) { FastlaneCore::Helper.windows? ? "log \n" : "log\n" }
       let(:failing_command_error_input) { FastlaneCore::Helper.windows? ? "log " : "log" }
 
+      # A status object of the shape FastlanePty reads, for examples that stub
+      # PTY.spawn and so have no real child to reap.
+      let(:stubbed_status) do
+        instance_double(Process::Status, exitstatus: 0, signaled?: false)
+      end
+
       it 'executes a simple command successfully' do
         unless FastlaneCore::Helper.windows?
-          expect(Process).to receive(:wait)
+          expect(Process).to receive(:wait2).and_call_original
         end
 
         result = FastlaneSpec::Env.with_env_values('FASTLANE_EXEC_FLUSH_PTY_WORKAROUND' => '1') do
@@ -15,6 +28,32 @@ describe FastlaneCore do
         end
 
         expect(result).to eq('foo')
+      end
+
+      it 'reads output as UTF-8 whatever the default encoding, and restores it', unless: FastlaneCore::Helper.windows? do
+        allow(FastlaneCore::UI).to receive(:command)
+        allow(FastlaneCore::UI).to receive(:command_output)
+        previous = [Encoding.default_external, Encoding.default_internal]
+        Encoding.default_external = Encoding::US_ASCII
+        Encoding.default_internal = nil
+
+        result = FastlaneCore::CommandExecutor.execute(command: "printf 'caf\\303\\251\\n'", print_all: true)
+        after = [Encoding.default_external, Encoding.default_internal]
+
+        expect(result).to eq("café")
+        expect(result.encoding).to eq(Encoding::UTF_8)
+        expect(FastlaneCore::UI).to have_received(:command_output).with("café")
+        expect(after).to eq([Encoding::US_ASCII, nil])
+      ensure
+        Encoding.default_external, Encoding.default_internal = previous
+      end
+
+      it 'names the signal when the command is killed', unless: FastlaneCore::Helper.windows? do
+        allow(FastlaneCore::UI).to receive(:command)
+        expect do
+          # The shell Ruby starts kills itself: Ubuntu's dash, given "sh -c ...", would wait for the inner shell and exit 137
+          FastlaneCore::CommandExecutor.execute(command: "kill -9 $$", suppress_error_output: true)
+        end.to raise_error(FastlaneCore::FastlanePtyError, /\AProcess crashed: killed by SIGKILL\z/)
       end
 
       it 'handles reading which throws a EIO exception', requires_pty: true do
@@ -29,15 +68,15 @@ describe FastlaneCore do
         expect(fake_std_in).to receive(:close)
         expect(fake_std_out).to receive(:close)
 
-        # Make a fake child process so we have a valid PID and $? is set correctly
+        # Make a fake child process so there is a valid PID to reap
         expect(PTY).to receive(:spawn) do |command, &block|
           expect(command).to eq('ls')
 
-          # PTY uses "$?" to get exitcode, which is filled in by Process.wait(),
-          # so we have to spawn a real process unless we want to mock methods
-          # on nil.
-          child_process_id = Process.spawn('echo foo', out: File::NULL)
-          expect(Process).to receive(:wait).with(child_process_id)
+          # wait2 returns the status now, so the example hands one back rather
+          # than spawning a process for FastlanePty to reap. PTY.spawn is
+          # stubbed here, so there is no real child for the pid to refer to.
+          child_process_id = 4242
+          expect(Process).to receive(:wait2).with(child_process_id).and_return([child_process_id, stubbed_status])
 
           block.yield(fake_std_in, fake_std_out, child_process_id)
         end
@@ -65,11 +104,11 @@ describe FastlaneCore do
         expect(PTY).to receive(:spawn) do |command, &block|
           expect(command).to eq('echo foo')
 
-          # PTY uses "$?" to get exitcode, which is filled in by Process.wait(),
-          # so we have to spawn a real process unless we want to mock methods
-          # on nil.
-          child_process_id = Process.spawn('echo foo', out: File::NULL)
-          expect(Process).to receive(:wait).with(child_process_id)
+          # wait2 returns the status now, so the example hands one back rather
+          # than spawning a process for FastlanePty to reap. PTY.spawn is
+          # stubbed here, so there is no real child for the pid to refer to.
+          child_process_id = 4242
+          expect(Process).to receive(:wait2).with(child_process_id).and_return([child_process_id, stubbed_status])
 
           block.yield(fake_std_in, fake_std_out, child_process_id)
         end
@@ -88,7 +127,7 @@ Shopping list:
 
       it "does not print output to stdout when status != 0 and output was already printed" do
         unless FastlaneCore::Helper.windows?
-          expect(Process).to receive(:wait)
+          expect(Process).to receive(:wait2).and_call_original
         end
 
         expect do
@@ -102,7 +141,7 @@ Shopping list:
 
       it "prints output to stdout only once when status != 0 and output was not already printed" do
         unless FastlaneCore::Helper.windows?
-          expect(Process).to receive(:wait).exactly(3)
+          expect(Process).to receive(:wait2).exactly(3).and_call_original
         end
 
         expect do
@@ -133,9 +172,28 @@ Shopping list:
         end.to output(failing_command_output).to_stdout
       end
 
+      # 127 comes from a child that could not start the program: only the PTY reports it, and Windows has none
+      it "calls the error block once, with exit status 127, when the program does not exist", unless: FastlaneCore::Helper.windows? do
+        allow(FastlaneCore::UI).to receive(:command)
+        calls = []
+        result = FastlaneCore::CommandExecutor.execute(command: "fl-no-such-program", suppress_error_output: true, error: proc { |output, status| calls << [output, status] })
+
+        expect(calls).to eq([[result, 127]])
+        expect(result).to match(/No such file or directory/)
+      end
+
+      it "calls the error block once, with exit status -1, when the command is killed", unless: FastlaneCore::Helper.windows? do
+        allow(FastlaneCore::UI).to receive(:command)
+        calls = []
+        # The shell Ruby starts kills itself: Ubuntu's dash, given "sh -c ...", would wait for the inner shell and exit 137
+        FastlaneCore::CommandExecutor.execute(command: "kill -9 $$", suppress_error_output: true, error: proc { |output, status| calls << status })
+
+        expect(calls).to eq([-1])
+      end
+
       it "calls error block with output argument" do
         unless FastlaneCore::Helper.windows?
-          expect(Process).to receive(:wait).twice
+          expect(Process).to receive(:wait2).twice.and_call_original
         end
 
         error_block_input = nil
@@ -161,7 +219,7 @@ Shopping list:
 
       it "does not print output or exit status when failure output is suppressed" do
         unless FastlaneCore::Helper.windows?
-          expect(Process).to receive(:wait)
+          expect(Process).to receive(:wait2).and_call_original
         end
 
         error_block_input = nil
@@ -242,10 +300,9 @@ Shopping list:
         allow(command_error).to receive(:exit_status).and_return(42)
         expect(FastlaneCore::FastlanePty).to receive(:spawn).and_raise(command_error)
 
-        error_block_input = nil
-        error_block_status = nil
+        error_block_calls = []
 
-        expect(FastlaneCore::UI).to receive(:error).with("Exit status: 42")
+        expect(FastlaneCore::UI).not_to receive(:error)
 
         expect do
           FastlaneSpec::Env.with_verbose(true) do
@@ -254,20 +311,18 @@ Shopping list:
               print_command: false,
               suppress_error_output: true,
               error: proc do |error_output, status|
-                error_block_input = error_output
-                error_block_status = status
+                error_block_calls << [error_output, status]
               end
             )
           end
         end.to output("pty error\n").to_stdout
 
-        expect(error_block_input).to eq("pty error")
-        expect(error_block_status).to eq(42)
+        expect(error_block_calls).to eq([["pty error", 42]])
       end
 
       it "still raises when failure output is suppressed without an error block" do
         unless FastlaneCore::Helper.windows?
-          expect(Process).to receive(:wait)
+          expect(Process).to receive(:wait2).and_call_original
         end
 
         raised_error = nil

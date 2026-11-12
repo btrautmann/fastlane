@@ -82,7 +82,7 @@ module Supply
 
       UI.verbose("Fetching a new access token from Google...")
 
-      auth_client.fetch_access_token!
+      auth_client.apply!({}) # fetches the first token; fetch_access_token! is private on impersonated credentials
 
       if FastlaneCore::Env.truthy?("DEBUG")
         Google::Apis.logger.level = Logger::DEBUG
@@ -533,6 +533,12 @@ module Supply
     def track_releases(track)
       result = get_edit_track(track)
       result&.releases || []
+    end
+
+    def list_track_release_summaries(package_name, track)
+      call_google_api do
+        client.list_application_track_releases("applications/#{package_name}/tracks/#{track}")
+      end.releases || []
     end
 
     def upload_changelogs(track, track_name)
